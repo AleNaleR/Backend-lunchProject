@@ -1,3 +1,5 @@
+// ===== ค่าตั้งต้น =====
+
 export const CONFIG = {
   shop: { lat: 16.2469, lng: 103.2522 },
   pricePerBox: 65,
@@ -8,9 +10,15 @@ export const CONFIG = {
   maxOrdersPerRider: 3,
   departMinutes: 11 * 60 + 30,
   deadlineMinutes: 12 * 60 + 30,
-  roadFactor: 1.3, 
-  serviceMinutes: 2, 
+  serviceMinutes: 2,
 };
+
+// ส่งสาย 1 จุด ปรับ 1000 ให้แผนที่ไม่สายชนะเสมอ
+const LATE_PENALTY = 1000;
+
+const RIDER_COLORS = ["#e53935", "#43a047", "#1e88e5", "#fb8c00", "#8e24aa", "#00acc1", "#6d4c41", "#d81b60", "#7cb342", "#3949ab"];
+
+// ===== ชนิดข้อมูล =====
 
 export interface Point {
   lat: number;
@@ -25,6 +33,20 @@ export interface Stop extends Point {
   boxes: number;
 }
 
+// เส้นทางของไรเดอร์ 1 คน
+export interface Route {
+  stops: Stop[];
+  km: number;
+  boxes: number;
+  fee: number;
+  arrivals: number[]; // เวลาถึงแต่ละจุด เป็นนาทีนับจากเที่ยงคืน
+  lateCount: number;
+}
+
+type RouteCost = Pick<Route, "fee" | "lateCount">;
+
+// ===== ฟังก์ชันพื้นฐาน =====
+
 export function distanceKm(a: Point, b: Point): number {
   const R = 6371;
   const rad = (x: number) => (x * Math.PI) / 180;
@@ -33,11 +55,7 @@ export function distanceKm(a: Point, b: Point): number {
   const h =
     Math.sin(dLat / 2) ** 2 +
     Math.cos(rad(a.lat)) * Math.cos(rad(b.lat)) * Math.sin(dLng / 2) ** 2;
-  return 2 * R * Math.asin(Math.sqrt(h)) * CONFIG.roadFactor;
-}
-
-export function riderFee(boxes: number, km: number): number {
-  return CONFIG.riderBaseFee + CONFIG.riderPerKmPerBox * boxes * km;
+  return 2 * R * Math.asin(Math.sqrt(h));
 }
 
 export function minToTime(min: number): string {
@@ -46,62 +64,20 @@ export function minToTime(min: number): string {
   return String(h).padStart(2, "0") + ":" + String(m).padStart(2, "0");
 }
 
-// ระยะทางนับจากร้านถึงจุดส่งสุดท้าย ไม่รวมขากลับร้าน
-export function routeInfo(stops: Stop[]) {
-  let prev: Point = CONFIG.shop;
-  let km = 0;
-  let boxes = 0;
-  const arrivals: number[] = [];
-  stops.forEach((s, i) => {
-    km += distanceKm(prev, s);
-    boxes += s.boxes;
-    arrivals.push(CONFIG.departMinutes + (km / CONFIG.speedKmh) * 60 + CONFIG.serviceMinutes * i);
-    prev = s;
-  });
-  const lateCount = arrivals.filter((t) => t > CONFIG.deadlineMinutes).length;
-  return { km, boxes, fee: riderFee(boxes, km), arrivals, lateCount };
-}
-
-//แบ่งกลุ่มแบบกวาดมุม (sweep) เรียงออเดอร์ตามมุมรอบร้านแล้วตัดเป็นกลุ่มละ 3
-const TWO_PI = 2 * Math.PI;
-
-function angleFrom(s: Point, startAngle: number): number {
-  const { lat: sLat, lng: sLng } = CONFIG.shop;
-  const kx = Math.cos((sLat * Math.PI) / 180);
-  const a = Math.atan2((s.lng - sLng) * kx, s.lat - sLat) - startAngle;
-  return ((a % TWO_PI) + TWO_PI) % TWO_PI;
-}
-
-export function sweepGroups(orders: Stop[], startAngle = -Math.PI): Stop[][] {
-  const sorted = [...orders].sort((a, b) => angleFrom(a, startAngle) - angleFrom(b, startAngle));
-  const groups: Stop[][] = [];
-  for (let i = 0; i < sorted.length; i += CONFIG.maxOrdersPerRider) {
-    groups.push(sorted.slice(i, i + CONFIG.maxOrdersPerRider));
-  }
-  return groups;
-}
+const round2 = (n: number) => Math.round(n * 100) / 100;
 
 function permutations<T>(items: T[]): T[][] {
   if (items.length <= 1) return [items];
-  return items.flatMap((item, i) =>
-    permutations([...items.slice(0, i), ...items.slice(i + 1)]).map((rest) => [item, ...rest])
-  );
-}
-
-export function bestOrder(group: Stop[]): Stop[] {
-  let best = group;
-  let bestCost = Infinity;
-  for (const perm of permutations(group)) {
-    const info = routeInfo(perm);
-    const cost = info.lateCount * 1000 + info.km;
-    if (cost < bestCost) {
-      best = perm;
-      bestCost = cost;
+  const result: T[][] = [];
+  for (let i = 0; i < items.length; i++) {
+    for (const rest of permutations(items.toSpliced(i, 1))) {
+      result.push([items[i]!, ...rest]);
     }
   }
-  return best;
+  return result;
 }
 
+// ตัวสุ่มที่กำหนด seed ได้ seed เดิมได้เลขสุ่มชุดเดิมทุกครั้ง
 function seededRandom(seed: number) {
   let a = seed >>> 0;
   return () => {
@@ -113,66 +89,119 @@ function seededRandom(seed: number) {
   };
 }
 
-interface GroupEval {
-  fee: number;
-  late: number;
+// ===== 1. เส้นทางของไรเดอร์ 1 คน =====
+
+// วัดเส้นทางตามลำดับจุดส่งที่ให้มา ระยะทางนับจากร้านถึงจุดส่งสุดท้าย ไม่รวมขากลับร้าน
+export function measureRoute(stops: Stop[]): Route {
+  let prev: Point = CONFIG.shop;
+  let km = 0;
+  let boxes = 0;
+  const arrivals: number[] = [];
+  stops.forEach((s, i) => {
+    km += distanceKm(prev, s);
+    boxes += s.boxes;
+    arrivals.push(CONFIG.departMinutes + (km / CONFIG.speedKmh) * 60 + CONFIG.serviceMinutes * i);
+    prev = s;
+  });
+  const fee = CONFIG.riderBaseFee + CONFIG.riderPerKmPerBox * boxes * km;
+  const lateCount = arrivals.filter((t) => t > CONFIG.deadlineMinutes).length;
+  return { stops, km, boxes, fee, arrivals, lateCount };
 }
 
-function evalGroup(group: Stop[], cache: Map<string, GroupEval>): GroupEval {
-  if (group.length === 0) return { fee: 0, late: 0 };
-  const key = group.map((s) => s.orderId).sort((a, b) => a - b).join(",");
-  let e = cache.get(key);
-  if (!e) {
-    const info = routeInfo(bestOrder(group));
-    e = { fee: info.fee, late: info.lateCount };
-    cache.set(key, e);
+// ลองทุกลำดับการส่งในกลุ่ม (ไม่เกิน 3! = 6 แบบ) เลือกแบบที่สายน้อยสุด แล้วระยะสั้นสุด
+export function bestRoute(group: Stop[]): Route {
+  let best = measureRoute(group);
+  let bestScore = Infinity;
+  for (const stops of permutations(group)) {
+    const route = measureRoute(stops);
+    const score = route.lateCount * LATE_PENALTY + route.km;
+    if (score < bestScore) {
+      best = route;
+      bestScore = score;
+    }
   }
-  return e;
+  return best;
 }
 
-function optimizeGroups(orders: Stop[], seed: number): Stop[][] {
+// ===== 2. แบ่งออเดอร์เป็นกลุ่ม กลุ่มละไม่เกิน 3 ออเดอร์ =====
+
+const TWO_PI = 2 * Math.PI;
+// ที่ละติจูดของร้าน ลองจิจูด 1 องศาสั้นกว่าละติจูด 1 องศา ต้องย่อก่อนคิดมุม
+const LNG_SCALE = Math.cos((CONFIG.shop.lat * Math.PI) / 180);
+
+// มุมของจุดรอบร้าน วัดจาก startAngle ได้ค่า 0 ถึง 2π
+function angleAroundShop(p: Point, startAngle: number): number {
+  const a = Math.atan2((p.lng - CONFIG.shop.lng) * LNG_SCALE, p.lat - CONFIG.shop.lat) - startAngle;
+  return ((a % TWO_PI) + TWO_PI) % TWO_PI;
+}
+
+// ต้นทุนของแผน = ค่าไรเดอร์รวม + ค่าปรับส่งสาย ยิ่งน้อยยิ่งดี
+const planCost = (costs: RouteCost[]) => costs.reduce((sum, c) => sum + c.fee + c.lateCount * LATE_PENALTY, 0);
+
+// ค้นหาการแบ่งกลุ่ม 1 รอบ: กวาดมุมจากจุดเริ่มแบบสุ่ม แล้วปรับกลุ่มไปเรื่อย ๆ จนไม่มีทางไหนถูกลง
+function searchGroups(orders: Stop[], seed: number): Stop[][] {
   const rand = seededRandom(seed);
-  const cache = new Map<string, GroupEval>();
 
-  const score = (parts: GroupEval[]) => parts.reduce((sum, p) => sum + p.fee + p.late * 1000, 0);
+  // กลุ่มเดียวกันจะเรียงแบบไหนก็ได้ค่าเท่ากัน จึงจำผลไว้ตามชุดเลขออเดอร์
+  const costCache = new Map<string, RouteCost>();
+  const groupCost = (group: Stop[]): RouteCost => {
+    if (group.length === 0) return { fee: 0, lateCount: 0 };
+    const key = group.map((s) => s.orderId).sort((a, b) => a - b).join(",");
+    let cost = costCache.get(key);
+    if (!cost) {
+      cost = bestRoute(group);
+      costCache.set(key, cost);
+    }
+    return cost;
+  };
 
-  const groups = sweepGroups(orders, rand() * TWO_PI - Math.PI);
+  // กวาดมุม (sweep): เรียงออเดอร์ตามมุมรอบร้านแล้วตัดเป็นกลุ่มละ 3
+  const startAngle = rand() * TWO_PI - Math.PI;
+  const sorted = [...orders].sort((a, b) => angleAroundShop(a, startAngle) - angleAroundShop(b, startAngle));
+  const groups: Stop[][] = [];
+  for (let i = 0; i < sorted.length; i += CONFIG.maxOrdersPerRider) {
+    groups.push(sorted.slice(i, i + CONFIG.maxOrdersPerRider));
+  }
+  // เผื่อกลุ่มว่างไว้ ให้ย้ายออเดอร์ไปเปิดไรเดอร์คนใหม่ได้
   while (groups.length < orders.length) groups.push([]);
-  let parts = groups.map((g) => evalGroup(g, cache));
-  let current = score(parts);
+  let groupCosts = groups.map(groupCost);
+  let currentCost = planCost(groupCosts);
 
+  // เปลี่ยนกลุ่ม a, b เป็นค่าใหม่ ถ้าต้นทุนรวมลดลงจริง
   const tryChange = (a: number, newA: Stop[], b: number, newB: Stop[]) => {
-    const next = [...parts];
-    next[a] = evalGroup(newA, cache);
-    next[b] = evalGroup(newB, cache);
-    const s = score(next);
-    if (s >= current - 1e-9) return false;
+    const nextCosts = [...groupCosts];
+    nextCosts[a] = groupCost(newA);
+    nextCosts[b] = groupCost(newB);
+    const nextCost = planCost(nextCosts);
+    if (nextCost >= currentCost - 1e-9) return false;
     groups[a] = newA;
     groups[b] = newB;
-    parts = next;
-    current = s;
+    groupCosts = nextCosts;
+    currentCost = nextCost;
     return true;
   };
 
+  // ลองย้ายออเดอร์ 1 ตัวไปกลุ่มอื่น หรือสลับออเดอร์ข้ามกลุ่ม เจอแบบที่ถูกลงก็เปลี่ยนทันที
   const improveOnce = () => {
-    const indexes = groups.map((_, i) => i);
-    for (let i = indexes.length - 1; i > 0; i--) {
+    // สุ่มลำดับกลุ่มที่จะลอง
+    const visitOrder = groups.map((_, i) => i);
+    for (let i = visitOrder.length - 1; i > 0; i--) {
       const j = Math.floor(rand() * (i + 1));
-      [indexes[i], indexes[j]] = [indexes[j]!, indexes[i]!];
+      [visitOrder[i], visitOrder[j]] = [visitOrder[j]!, visitOrder[i]!];
     }
     const firstEmpty = groups.findIndex((g) => g.length === 0);
-    for (const a of indexes) {
-      const ga = groups[a]!;
-      for (let i = 0; i < ga.length; i++) {
-        for (const b of indexes) {
+    for (const [posA, a] of visitOrder.entries()) {
+      const groupA = groups[a]!;
+      for (let i = 0; i < groupA.length; i++) {
+        for (const [posB, b] of visitOrder.entries()) {
           if (a === b) continue;
-          const gb = groups[b]!;
-          const canMove = gb.length < CONFIG.maxOrdersPerRider && (gb.length > 0 || b === firstEmpty);
-          if (canMove && tryChange(a, ga.filter((_, k) => k !== i), b, [...gb, ga[i]!])) return true;
-          for (let j = 0; j < gb.length; j++) {
-            const newA = ga.map((s, k) => (k === i ? gb[j]! : s));
-            const newB = gb.map((s, k) => (k === j ? ga[i]! : s));
-            if (tryChange(a, newA, b, newB)) return true;
+          const groupB = groups[b]!;
+          const canMove = groupB.length < CONFIG.maxOrdersPerRider && (groupB.length > 0 || b === firstEmpty);
+          if (canMove && tryChange(a, groupA.toSpliced(i, 1), b, [...groupB, groupA[i]!])) return true;
+          // คู่ที่ b มาก่อน a ลองสลับไปแล้วตอนวนถึง b
+          if (posB < posA) continue;
+          for (let j = 0; j < groupB.length; j++) {
+            if (tryChange(a, groupA.with(i, groupB[j]!), b, groupB.with(j, groupA[i]!))) return true;
           }
         }
       }
@@ -182,59 +211,41 @@ function optimizeGroups(orders: Stop[], seed: number): Stop[][] {
 
   for (let step = 0; step < 500 && improveOnce(); step++);
 
-  const firstAngle = (g: Stop[]) => Math.min(...g.map((s) => angleFrom(s, -Math.PI)));
+  const firstAngle = (g: Stop[]) => Math.min(...g.map((s) => angleAroundShop(s, -Math.PI)));
   return groups.filter((g) => g.length > 0).sort((x, y) => firstAngle(x) - firstAngle(y));
 }
 
-// สุ่มเริ่มต้นหลายรอบ (ตาม seed) แล้วเลือกแผนที่ค่าไรเดอร์ต่ำที่สุด
-const TRIES = 20;
-// seed ที่หารด้วย 10 ลงตัว ค้นเต็ม 20 รอบ ส่วน seed อื่นค้น 3 รอบ
-const triesFor = (seed: number) => (seed % 10 === 0 ? TRIES : 3);
+// ===== 3. สร้างแผนส่งพร้อมสรุปกำไร =====
 
-function groupsCost(groups: Stop[][]) {
-  return groups.reduce((sum, g) => {
-    const info = routeInfo(bestOrder(g));
-    return sum + info.fee + info.lateCount * 1000;
-  }, 0);
-}
-
-function bestGroups(orders: Stop[], seed: number): Stop[][] {
-  let best: Stop[][] = [];
+export function buildPlan(orders: Stop[], seed = 0) {
+  // ค้นหลายรอบแล้วเลือกแผนที่ถูกที่สุด seed ที่หารด้วย 10 ลงตัวค้น 20 รอบ ส่วน seed อื่นค้น 3 รอบ
+  const tries = seed % 10 === 0 ? 20 : 3;
+  let routes: Route[] = [];
   let bestCost = Infinity;
-  for (let k = 0; k < triesFor(seed); k++) {
-    const groups = optimizeGroups(orders, seed + k);
-    const cost = groupsCost(groups);
+  for (let k = 0; k < tries; k++) {
+    const candidate = searchGroups(orders, seed + k).map(bestRoute);
+    const cost = planCost(candidate);
     if (cost < bestCost) {
-      best = groups;
+      routes = candidate;
       bestCost = cost;
     }
   }
-  return best;
-}
 
-const RIDER_COLORS = ["#e53935", "#43a047", "#1e88e5", "#fb8c00", "#8e24aa", "#00acc1", "#6d4c41", "#d81b60", "#7cb342", "#3949ab"];
-
-const round2 = (n: number) => Math.round(n * 100) / 100;
-
-export function buildPlan(orders: Stop[], seed = 0) {
-  const riders = bestGroups(orders, seed)
-    .map(bestOrder)
-    .map((stops, i) => {
-      const info = routeInfo(stops);
-      const finish = info.arrivals[info.arrivals.length - 1] ?? CONFIG.departMinutes;
-      return {
-        riderNo: i + 1,
-        color: RIDER_COLORS[i % RIDER_COLORS.length]!,
-        stops,
-        boxes: info.boxes,
-        km: round2(info.km),
-        fee: round2(info.fee),
-        arrivals: info.arrivals.map(minToTime),
-        finishTime: minToTime(finish),
-        durationMin: round2(finish - CONFIG.departMinutes),
-        lateCount: info.lateCount,
-      };
-    });
+  const riders = routes.map((route, i) => {
+    const finish = route.arrivals.at(-1) ?? CONFIG.departMinutes;
+    return {
+      riderNo: i + 1,
+      color: RIDER_COLORS[i % RIDER_COLORS.length]!,
+      stops: route.stops,
+      boxes: route.boxes,
+      km: round2(route.km),
+      fee: round2(route.fee),
+      arrivals: route.arrivals.map(minToTime),
+      finishTime: minToTime(finish),
+      durationMin: round2(finish - CONFIG.departMinutes),
+      lateCount: route.lateCount,
+    };
+  });
 
   const boxes = riders.reduce((sum, r) => sum + r.boxes, 0);
   const revenue = boxes * CONFIG.pricePerBox;
