@@ -1,0 +1,31 @@
+info:
+  name: customer-get
+  type: http
+  seq: 5
+
+http:
+  method: GET
+  url: http://localhost:3000/customer?name=som
+  params:
+    - name: name
+      value: som
+      type: query
+  body:
+    type: json
+    data: |-
+      {
+        "firstname": "Somchai",
+        "lastname": "Jaidee",
+        "phone": "0812345678",
+        "address": "Maha Sarakham",
+        "lat": 16.2469,
+        "lng": 103.2522
+      }
+  auth: inherit
+
+settings:
+  encodeUrl: true
+  timeout: 0
+  followRedirects: true
+  maxRedirects: 5
+​
